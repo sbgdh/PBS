@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <string>
 #include <shellapi.h>
+#include <cstdio>
 
 #pragma comment(lib, "PowrProf.lib")
 #pragma comment(lib, "User32.lib")
@@ -12,8 +13,11 @@
 #pragma comment(lib, "Shell32.lib")
 
 // ================= 常量定义 =================
+// 视频子组 GUID
 constexpr GUID kGuidSubVideo = { 0x7516b95f,0xf776,0x4464,{0x8c,0x53,0x06,0x16,0x7f,0x40,0xcc,0x99} };
+// 屏幕亮度 GUID
 constexpr GUID kGuidVideoBrightness = { 0xaded5e82,0xb909,0x4619,{0x99,0x49,0xf5,0xd7,0x1d,0xac,0x0b,0xcb} };
+// 显示状态 GUID (用于检测屏幕开关)
 constexpr GUID kGuidConsoleDisplayState = { 0x6fe69556, 0x704a, 0x47a0, { 0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47 } };
 
 #define ID_TIMER_DEBOUNCE 1
@@ -43,12 +47,16 @@ bool ExecuteSilent(const std::wstring& parameters) {
     sei.lpVerb = L"open";
     sei.lpFile = L"schtasks.exe";
     sei.lpParameters = parameters.c_str();
-    sei.nShow = SW_HIDE; // 隐藏窗口
+    sei.nShow = SW_HIDE;
 
     if (ShellExecuteExW(&sei) && sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 5000); // 等待任务完成
+        WaitForSingleObject(sei.hProcess, 5000); // 等待最长5秒
+        
+        DWORD exitCode = 0;
+        GetExitCodeProcess(sei.hProcess, &exitCode); // 获取退出代码
+        
         CloseHandle(sei.hProcess);
-        return true;
+        return (exitCode == 0); // 只有返回 0 才代表 schtasks 执行成功
     }
     return false;
 }
@@ -93,6 +101,8 @@ void PerformSync() {
             if (currentDC != dc) PowerWriteDCValueIndex(nullptr, &scheme, &kGuidSubVideo, &kGuidVideoBrightness, dc);
         }
     }
+    Sleep(60);
+    PowerSetActiveScheme(nullptr, &g_activeScheme);
     LocalFree(pActive);
 }
 
