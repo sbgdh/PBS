@@ -5,28 +5,27 @@
 #include <windows.h>
 #include <powrprof.h>
 #include <vector>
-#include <algorithm> // for std::clamp
+#include <algorithm>
+#include <string> // 使用 wstring
 #include <shellapi.h>
 
 #pragma comment(lib, "PowrProf.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Kernel32.lib")
+#pragma comment(lib, "Shell32.lib") // 新增 Shell32
 
 // ================= 常量定义 =================
 constexpr GUID kGuidSubVideo = { 0x7516b95f,0xf776,0x4464,{0x8c,0x53,0x06,0x16,0x7f,0x40,0xcc,0x99} };
 constexpr GUID kGuidVideoBrightness = { 0xaded5e82,0xb909,0x4619,{0x99,0x49,0xf5,0xd7,0x1d,0xac,0x0b,0xcb} };
 
 #define ID_TIMER_DEBOUNCE 1
-#define DEBOUNCE_DELAY_MS 400 // 防抖延迟 400ms
+#define DEBOUNCE_DELAY_MS 400
 
-
-std::vector<GUID> g_cachedSchemes;
 GUID g_activeScheme = { 0 };
 
 // ================= 辅助函数 =================
 
-// 获取管理员权限状态
 bool IsAdministrator() {
     BOOL isAdmin = FALSE;
     PSID adminGroup = nullptr;
@@ -39,20 +38,19 @@ bool IsAdministrator() {
     return isAdmin;
 }
 
-// 缓存电源方案 (启动时执行一次即可)
-void CachePowerSchemes() {
-    g_cachedSchemes.clear();
-    // 预留空间避免重新分配
-    g_cachedSchemes.reserve(10); 
-    
-    DWORD index = 0;
-    while (true) {
-        GUID scheme;
-        DWORD bufSize = sizeof(scheme);
-        LONG ret = PowerEnumerate(nullptr, nullptr, nullptr, ACCESS_SCHEME, index, (UCHAR*)&scheme, &bufSize);
-        if (ret != ERROR_SUCCESS) break;
-        g_cachedSchemes.push_back(scheme);
-        index++;
+// 辅助执行命令（静默模式，不闪烁黑框）
+void ExecuteSilent(const std::wstring& parameters) {
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = nullptr;
+    sei.lpVerb = L"open";
+    sei.lpFile = L"schtasks.exe";
+    sei.lpParameters = parameters.c_str();
+    sei.nShow = SW_HIDE; // 关键：隐藏窗口
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 5000); // 等待最多5秒
+        CloseHandle(sei.hProcess);
     }
 }
 
@@ -61,30 +59,51 @@ void PerformSync() {
     GUID* pActive = nullptr;
     if (PowerGetActiveScheme(nullptr, &pActive) != ERROR_SUCCESS) return;
     g_activeScheme = *pActive;
-    LocalFree(pActive);
-
+    
+    // 获取当前亮度
     DWORD ac = 0, dc = 0;
-    // 读取当前亮度
-    if (PowerReadACValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &ac) != ERROR_SUCCESS) return;
-    if (PowerReadDCValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &dc) != ERROR_SUCCESS) return;
+    DWORD resAc = PowerReadACValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &ac);
+    DWORD resDc = PowerReadDCValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &dc);
 
-
+    // 只要有一个读取成功就继续，防止某些极端情况
+    if (resAc != ERROR_SUCCESS && resDc != ERROR_SUCCESS) {
+        LocalFree(pActive);
+        return;
+    }
+    
     ac = std::clamp<DWORD>(ac, 0, 100);
     dc = std::clamp<DWORD>(dc, 0, 100);
 
-    // 遍历缓存并写入 (Smart Write)
-    for (const auto& scheme : g_cachedSchemes) {
+    // 动态枚举方案，确保用户新增/删除方案后也能正常工作
+    // 这里的开销极小，且仅在防抖后触发一次，完全可以接受
+    DWORD index = 0;
+    while (true) {
+        GUID scheme;
+        DWORD bufSize = sizeof(scheme);
+        if (PowerEnumerate(nullptr, nullptr, nullptr, ACCESS_SCHEME, index, (UCHAR*)&scheme, &bufSize) != ERROR_SUCCESS) {
+            break;
+        }
+        index++;
+
+        // 跳过当前激活的方案
         if (IsEqualGUID(scheme, g_activeScheme)) continue;
 
+        // Smart Write: 只有值不同时才写入，减少注册表操作
         DWORD currentAC = 0, currentDC = 0;
-        // 只有值不同时才写入
+        
         if (PowerReadACValueIndex(nullptr, &scheme, &kGuidSubVideo, &kGuidVideoBrightness, &currentAC) == ERROR_SUCCESS) {
             if (currentAC != ac) PowerWriteACValueIndex(nullptr, &scheme, &kGuidSubVideo, &kGuidVideoBrightness, ac);
         }
+        
         if (PowerReadDCValueIndex(nullptr, &scheme, &kGuidSubVideo, &kGuidVideoBrightness, &currentDC) == ERROR_SUCCESS) {
             if (currentDC != dc) PowerWriteDCValueIndex(nullptr, &scheme, &kGuidSubVideo, &kGuidVideoBrightness, dc);
         }
     }
+    
+    // 激活方案变更（如果修改了非激活方案，有些系统可能不需要这步，但加上保险）
+    // 注意：不要调用 PowerSetActiveScheme，因为我们只是改了属性，不是切方案
+    
+    LocalFree(pActive);
 }
 
 // ================= 自启逻辑 =================
@@ -94,30 +113,27 @@ void HandleAutoRun(const wchar_t* cmd) {
     wchar_t exePath[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
 
+    // 使用 wstring 进行安全拼接
+    std::wstring pathStr = L"\"" + std::wstring(exePath) + L"\"";
+
     if (wcsstr(cmd, L"--onar")) {
-        // 静默创建计划任务，以管理员权限运行
-        wchar_t taskCmd[MAX_PATH * 3];
-        wsprintfW(taskCmd,
-            L"schtasks /Create /F /RL HIGHEST /SC ONLOGON /TN \"PowerBrightnessSync\" /TR \"\\\"%s\\\"\"",
-            exePath);
-        _wsystem(taskCmd);
+        // 创建任务
+        std::wstring args = L"/Create /F /RL HIGHEST /SC ONLOGON /TN \"PowerBrightnessSync\" /TR " + pathStr;
+        ExecuteSilent(args);
     }
     else if (wcsstr(cmd, L"--ofar")) {
-        // 删除计划任务
-        _wsystem(L"schtasks /Delete /F /TN \"PowerBrightnessSync\"");
+        // 删除任务
+        ExecuteSilent(L"/Delete /F /TN \"PowerBrightnessSync\"");
     }
 }
 
-// ================= 窗口过程 (单线程核心) =================
+// ================= 窗口过程 =================
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_POWERBROADCAST:
         if (wp == PBT_POWERSETTINGCHANGE && lp) {
             auto pbs = (PPOWERBROADCAST_SETTING)lp;
             if (IsEqualGUID(pbs->PowerSetting, kGuidVideoBrightness)) {
-                // 收到亮度变化：重置计时器
-                // SetTimer 会自动替换旧的 ID_TIMER_DEBOUNCE，实现防抖
-                // 此时不执行任何重操作，瞬间返回
                 SetTimer(hwnd, ID_TIMER_DEBOUNCE, DEBOUNCE_DELAY_MS, nullptr);
             }
         }
@@ -125,11 +141,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == ID_TIMER_DEBOUNCE) {
-            // 计时器触发，说明用户停止滑动 400ms 了
             KillTimer(hwnd, ID_TIMER_DEBOUNCE);
             PerformSync();
-            
-            // 再次修剪内存，确保同步后的临时内存被释放
+            // 每次同步完清理内存
             SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         }
         return 0;
@@ -142,46 +156,54 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ================= 入口点 =================
-
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int) {
-    // === 1. 先处理参数，独立执行自启注册/删除 ===
+    // 1. 处理参数 (自启设置)
     if (lpCmdLine && *lpCmdLine) {
         if (wcsstr(lpCmdLine, L"--onar") || wcsstr(lpCmdLine, L"--ofar")) {
+            // 需要管理员权限才能操作任务计划程序
+            if (!IsAdministrator()) {
+                MessageBoxW(nullptr, L"设置自启动需要管理员权限。", L"提示", MB_OK | MB_ICONWARNING);
+                return 1;
+            }
             HandleAutoRun(lpCmdLine);
-            return 0; // 参数模式执行完毕直接退出
+            return 0;
         }
     }
 
-    // === 2. 单例互斥，普通运行时生效 ===
+    // 2. 单例互斥
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\PowerBrightnessSync_Instance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
 
-    // 3. 权限检查
+    // 3. 权限检查 (运行时也需要管理员权限以写入电源设置)
     if (!IsAdministrator()) {
-        MessageBoxW(nullptr, L"请以管理员身份运行以启用同步。", L"PowerBrightnessSync", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, L"请以管理员身份运行以启用亮度同步。", L"PowerBrightnessSync", MB_OK | MB_ICONERROR);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
     // 4. 初始化
-    CachePowerSchemes();
-    PerformSync(); // 启动时同步一次
+    PerformSync();
 
-    // 5. 创建隐藏窗口
+    // 5. 创建 Message-Only Window
     WNDCLASSW wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.lpszClassName = L"PBS_Lite";
+    wc.lpszClassName = L"PBS_Lite_v2";
     RegisterClassW(&wc);
     
-    // 创建一个 message-only window
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
-    if (!hwnd) return 1;
+    if (!hwnd) {
+        if (hMutex) CloseHandle(hMutex);
+        return 1;
+    }
 
     // 6. 注册通知
     HPOWERNOTIFY hNotify = RegisterPowerSettingNotification(hwnd, &kGuidVideoBrightness, DEVICE_NOTIFY_WINDOW_HANDLE);
 
-    // 7. 内存优化：主动将工作集修剪到最小
-    // 内存回收，只留个空壳在 RAM 里
+    // 7. 初始内存修剪
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     // 8. 消息循环
@@ -192,6 +214,6 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int) {
     }
 
     if (hNotify) UnregisterPowerSettingNotification(hNotify);
-    CloseHandle(hMutex);
+    if (hMutex) CloseHandle(hMutex);
     return (int)msg.wParam;
 }
