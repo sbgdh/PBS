@@ -68,7 +68,7 @@ void PerformSync() {
     g_activeScheme = *pActive;
     
     // 获取当前亮度
-    DWORD ac = 0, dc = 0;
+    DWORD ac = 60, dc = 60;
     DWORD resAc = PowerReadACValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &ac);
     DWORD resDc = PowerReadDCValueIndex(nullptr, &g_activeScheme, &kGuidSubVideo, &kGuidVideoBrightness, &dc);
 
@@ -141,7 +141,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == ID_TIMER_DEBOUNCE) {
             KillTimer(hwnd, ID_TIMER_DEBOUNCE);
             PerformSync();
-            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         }
         return 0;
 
