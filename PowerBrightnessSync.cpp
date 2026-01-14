@@ -156,64 +156,111 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ================= 入口点 =================
-int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int) {
-    // 1. 处理参数 (自启设置)
-    if (lpCmdLine && *lpCmdLine) {
-        if (wcsstr(lpCmdLine, L"--onar") || wcsstr(lpCmdLine, L"--ofar")) {
-            // 需要管理员权限才能操作任务计划程序
-            if (!IsAdministrator()) {
-                MessageBoxW(nullptr, L"设置自启动需要管理员权限。", L"提示", MB_OK | MB_ICONWARNING);
-                return 1;
+int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // ---------------------------------------------------------
+    // 第一步：优先处理命令行参数 (完全绕过互斥体)
+    // ---------------------------------------------------------
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool isSetupMode = false; // 标记是否为设置模式
+
+    if (argv && argc > 1) {
+        // 遍历所有参数查找命令
+        for (int i = 1; i < argc; ++i) {
+            if (lstrcmpiW(argv[i], L"--onar") == 0) {
+                isSetupMode = true;
+                if (!IsAdministrator()) {
+                    MessageBoxW(nullptr, L"设置自启动失败：\n需要管理员权限。", L"权限不足", MB_OK | MB_ICONERROR);
+                } else {
+                    int ret = ManageAutoRun(true); // 你的自启函数
+                    if (ret == 1) MessageBoxW(nullptr, L"自启动设置成功！", L"提示", MB_OK | MB_ICONINFORMATION);
+                    else MessageBoxW(nullptr, L"自启动设置失败！\n请检查任务计划服务是否开启。", L"错误", MB_OK | MB_ICONERROR);
+                }
+                break; // 找到命令就跳出循环
             }
-            HandleAutoRun(lpCmdLine);
-            return 0;
+            else if (lstrcmpiW(argv[i], L"--ofar") == 0) {
+                isSetupMode = true;
+                if (!IsAdministrator()) {
+                    MessageBoxW(nullptr, L"取消自启动失败：\n需要管理员权限。", L"权限不足", MB_OK | MB_ICONERROR);
+                } else {
+                    ManageAutoRun(false);
+                    MessageBoxW(nullptr, L"已取消开机自启动。", L"提示", MB_OK | MB_ICONINFORMATION);
+                }
+                break;
+            }
         }
     }
+    if (argv) LocalFree(argv);
 
-    // 2. 单例互斥
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\PowerBrightnessSync_Instance");
+    // 【核心关键点】：如果是设置模式，执行完立刻退出程序！
+    // 绝对不要让代码运行到下面的 CreateMutex，否则会和正在运行的实例冲突。
+    if (isSetupMode) {
+        return 0; 
+    }
+
+    // ---------------------------------------------------------
+    // 第二步：由于没有参数，说明是正常启动，现在开始检查互斥体
+    // ---------------------------------------------------------
+    
+    // 检查是否已经有实例在运行
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\PowerBrightnessSync_Instance_v2");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 如果已经有一个在运行，直接退出，保持单例
         if (hMutex) CloseHandle(hMutex);
         return 0;
     }
 
-    // 3. 权限检查 (运行时也需要管理员权限以写入电源设置)
+    // ---------------------------------------------------------
+    // 第三步：权限检查与初始化 (只有获胜的单例才会执行到这里)
+    // ---------------------------------------------------------
+    
+    // 运行时必须是管理员，否则无法写入电源设置
     if (!IsAdministrator()) {
-        MessageBoxW(nullptr, L"请以管理员身份运行以启用亮度同步。", L"PowerBrightnessSync", MB_OK | MB_ICONERROR);
+        // 可以选择静默退出，或者弹窗提示（建议开发阶段弹窗，稳定后静默）
+        // MessageBoxW(nullptr, L"请以管理员身份运行以启用同步。", L"权限提示", MB_OK);
         if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
-    // 4. 初始化
+    // 初始化同步一次
     PerformSync();
 
-    // 5. 创建 Message-Only Window
+    // ---------------------------------------------------------
+    // 第四步：创建消息窗口并进入循环
+    // ---------------------------------------------------------
     WNDCLASSW wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.lpszClassName = L"PBS_Lite_v2";
-    RegisterClassW(&wc);
+    wc.lpszClassName = L"PBS_Lite_Host";
     
+    if (!RegisterClassW(&wc)) {
+        if (hMutex) CloseHandle(hMutex);
+        return 1;
+    }
+
+    // 创建隐藏窗口用于接收电源通知
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
     if (!hwnd) {
         if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
-    // 6. 注册通知
     HPOWERNOTIFY hNotify = RegisterPowerSettingNotification(hwnd, &kGuidVideoBrightness, DEVICE_NOTIFY_WINDOW_HANDLE);
-
-    // 7. 初始内存修剪
+    
+    // 启动完成，修剪内存
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
-    // 8. 消息循环
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    // ---------------------------------------------------------
+    // 第五步：清理资源
+    // ---------------------------------------------------------
     if (hNotify) UnregisterPowerSettingNotification(hNotify);
     if (hMutex) CloseHandle(hMutex);
+
     return (int)msg.wParam;
 }
