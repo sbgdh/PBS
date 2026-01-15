@@ -107,21 +107,28 @@ void PerformSync() {
 // ================= 自启逻辑 =================
 int ManageAutoRun(bool enable) {
     wchar_t exePath[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return 0;
+    // 获取当前程序完整路径
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+        return 0; // 获取路径失败
+    }
 
-    wchar_t args[MAX_PATH * 2];
-    
+    wchar_t cmd[1024]; // 足够大的缓冲区
+
     if (enable) {
-        swprintf_s(args, MAX_PATH * 2, 
-            L"/Create /F /RL HIGHEST /SC ONLOGON /TN \"PowerBrightnessSync\" /TR \"\\\"%s\\\"\"", 
+        // 创建任务：用户登录时以最高权限运行
+        int result = swprintf_s(cmd, std::size(cmd),
+            L"schtasks.exe /Create /F /RL HIGHEST /SC ONLOGON /TN \"PowerBrightnessSync\" /TR \"\\\"%s\\\"\"",
             exePath);
-    }
-    else {
-        swprintf_s(args, MAX_PATH * 2, 
-            L"/Delete /F /TN \"PowerBrightnessSync\"");
+        if (result == -1) return 0; // 格式化失败
+    } else {
+        // 删除任务（强制）
+        int result = swprintf_s(cmd, std::size(cmd),
+            L"schtasks.exe /Delete /F /TN \"PowerBrightnessSync\"");
+        if (result == -1) return 0;
     }
 
-    return ExecuteSilent(args) ? 1 : 0;
+    // 执行命令并返回结果
+    return ExecuteSilent(cmd) ? 1 : 0;
 }
 
 // ================= 窗口过程 =================
@@ -234,3 +241,4 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     return (int)msg.wParam;
 }
+
